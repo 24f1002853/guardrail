@@ -1,24 +1,24 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import os
-import re
+import shlex
 import base64
-from pathlib import Path
+import re
 from urllib.parse import urlparse
 
 app = FastAPI()
 
-SECRET = "/home/agent/service-account.json"
 WORKSPACE = "/home/agent/workspace"
-BUILD = "/home/agent/workspace/build"
+BUILD = os.path.realpath("/home/agent/workspace/build")
+SECRET = os.path.realpath("/home/agent/service-account.json")
 
 ALLOWED_HOSTS = {
     "objects.githubusercontent.com",
-    "registry.npmjs.org"
+    "registry.npmjs.org",
 }
 
 
-class RequestModel(BaseModel):
+class ToolRequest(BaseModel):
     tool: str
     command: str | None = None
     path: str | None = None
@@ -27,7 +27,7 @@ class RequestModel(BaseModel):
     url: str | None = None
 
 
-def normalize_path(path: str):
+def normalize_path(path: str) -> str:
     path = os.path.expandvars(path)
     path = os.path.expanduser(path)
 
@@ -37,45 +37,78 @@ def normalize_path(path: str):
     return os.path.realpath(path)
 
 
-def contains_secret_path(text: str):
+def contains_secret_path(command: str) -> bool:
+    """Detect direct and obfuscated attempts to read the protected file."""
 
-    text = os.path.expandvars(text)
-    text = text.replace("~", "/home/agent")
+    candidates = [command]
 
-    if SECRET in text:
-        return True
+    # Expand shell variables
+    expanded = os.path.expandvars(command)
+    expanded = os.path.expanduser(expanded)
 
-    candidates = re.findall(r"[A-Za-z0-9+/=]{20,}", text)
+    if expanded != command:
+        candidates.append(expanded)
 
-    for c in candidates:
+    # Try decoding long base64-looking strings
+    for token in re.findall(r"[A-Za-z0-9+/=]{16,}", expanded):
         try:
-            decoded = base64.b64decode(c).decode(errors="ignore")
-            if SECRET in decoded:
-                return True
+            decoded = base64.b64decode(token).decode("utf-8", errors="ignore")
+            candidates.append(decoded)
         except Exception:
             pass
+
+    for text in candidates:
+        try:
+            tokens = shlex.split(text)
+        except Exception:
+            tokens = text.split()
+
+        for token in tokens:
+
+            token = token.strip("\"'`")
+
+            if "/" in token or token.startswith(".") or token.startswith("~") or "$HOME" in token:
+
+                token = os.path.expandvars(token)
+                token = os.path.expanduser(token)
+
+                if not os.path.isabs(token):
+                    token = os.path.join(WORKSPACE, token)
+
+                real = os.path.realpath(token)
+
+                if real == SECRET:
+                    return True
+
+        # Literal fallback
+        if SECRET in text:
+            return True
 
     return False
 
 
-def write_allowed(path: str):
+def write_allowed(path: str) -> bool:
     real = normalize_path(path)
-    build = os.path.realpath(BUILD)
 
-    try:
-        return Path(real).is_relative_to(Path(build))
-    except AttributeError:
-        return os.path.commonpath([real, build]) == build
+    return real == BUILD or real.startswith(BUILD + os.sep)
 
 
-def host_allowed(url: str):
+def host_allowed(url: str) -> bool:
     try:
         parsed = urlparse(url)
+
+        if parsed.scheme not in ("http", "https"):
+            return False
+
+        if parsed.username or parsed.password:
+            return False
+
         host = parsed.hostname
 
         if host is None:
             return False
 
+        # Exact hostname only
         return host in ALLOWED_HOSTS
 
     except Exception:
@@ -83,7 +116,7 @@ def host_allowed(url: str):
 
 
 @app.post("/")
-def guardrail(req: RequestModel):
+def guardrail(req: ToolRequest):
 
     if req.tool == "bash":
 
@@ -102,10 +135,12 @@ def guardrail(req: RequestModel):
 
     elif req.tool == "write_file":
 
-        if not write_allowed(req.path or ""):
+        path = req.path or ""
+
+        if not write_allowed(path):
             return {
                 "decision": "block",
-                "reason": "Writes are only permitted under /home/agent/workspace/build."
+                "reason": "Writes are only allowed under /home/agent/workspace/build."
             }
 
         return {
@@ -115,7 +150,9 @@ def guardrail(req: RequestModel):
 
     elif req.tool == "http_request":
 
-        if not host_allowed(req.url or ""):
+        url = req.url or ""
+
+        if not host_allowed(url):
             return {
                 "decision": "block",
                 "reason": "Destination host is not permitted."
